@@ -1,0 +1,5 @@
+# Private SSH keys - never commit
+*.pem
+
+# Personal learning notes
+docs/
