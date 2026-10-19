@@ -5,6 +5,7 @@
 
 set -euo pipefail
 
+# Settings; DRY_RUN and ASSUME_YES can only be turned on by flags, never by the environment
 PROJECT_TAG="${PROJECT_TAG:-AutomationLab}"
 KEY_DIR="${KEY_DIR:-$HOME/.ssh}"
 AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}"
@@ -14,9 +15,11 @@ ASSUME_YES=false
 export AWS_REGION
 export AWS_PAGER=""
 
+# Messages go to stderr so stdout only carries results
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
+# Scratch folder for delete batches, removed however the script exits
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 trap 'die "Command failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
@@ -31,6 +34,7 @@ Resources are selected by the tag Project=${PROJECT_TAG} in region ${AWS_REGION:
 EOF
 }
 
+# Parse options; unknown ones are an error so a typo never triggers a real deletion
 while (($#)); do
   case "$1" in
     -n | --dry-run) DRY_RUN=true ;;
@@ -57,6 +61,7 @@ delete_security_group() {
   done
 }
 
+# A versioned bucket is only empty once every version and delete marker is gone
 empty_bucket() {
   local bucket=$1 versions batch_file="${TMP_DIR}/delete.json" count errors
   while true; do
@@ -65,6 +70,7 @@ empty_bucket() {
       <<<"$versions" >"$batch_file"
     count=$(jq '.Objects | length' "$batch_file")
     ((count > 0)) || break
+    # delete-objects exits 0 even when some deletes fail, so count the reported errors
     errors=$(aws s3api delete-objects --bucket "$bucket" --delete "file://${batch_file}" \
       --query 'length(Errors || `[]`)' --output text)
     [[ "$errors" == "0" ]] || die "Failed to delete ${errors} object(s) from ${bucket}"
@@ -72,12 +78,14 @@ empty_bucket() {
   done
 }
 
+# Preflight: tools installed, region set, credentials valid
 command -v aws >/dev/null 2>&1 || die "AWS CLI is not installed"
 command -v jq >/dev/null 2>&1 || die "jq is not installed"
 [[ -n "$AWS_REGION" ]] || die "No AWS region set. Run 'aws configure' or export AWS_REGION"
 aws sts get-caller-identity >/dev/null 2>&1 || die "AWS credentials are missing or invalid"
 log "Region: ${AWS_REGION} | Looking for resources tagged Project=${PROJECT_TAG}"
 
+# Discover resources strictly by tag; nothing untagged is ever selected
 json=$(aws ec2 describe-instances \
   --filters Name=tag:Project,Values="$PROJECT_TAG" \
             Name=instance-state-name,Values=pending,running,stopping,stopped \
@@ -107,6 +115,7 @@ for bucket in "${TAGGED_BUCKETS[@]}"; do
   fi
 done
 
+# Always show what was found before doing anything
 echo
 echo "Resources tagged Project=${PROJECT_TAG} in ${AWS_REGION}:"
 echo "  EC2 instances:   ${INSTANCE_IDS[*]:-none}"
@@ -126,12 +135,14 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
+# Require an explicit "yes", or --yes when no one is at the terminal
 if [[ "$ASSUME_YES" != true ]]; then
   [[ -t 0 ]] || die "Not running interactively; pass --yes to confirm deletion"
   read -r -p "Permanently delete these ${total} resource(s)? Type 'yes' to continue: " answer
   [[ "$answer" == "yes" ]] || die "Aborted by user"
 fi
 
+# Delete in dependency order: instances -> security groups -> key pairs -> buckets
 if ((${#INSTANCE_IDS[@]} > 0)); then
   aws ec2 terminate-instances --instance-ids "${INSTANCE_IDS[@]}" >/dev/null
   log "Terminating ${INSTANCE_IDS[*]}, waiting..."

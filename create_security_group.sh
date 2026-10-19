@@ -4,6 +4,7 @@
 
 set -euo pipefail
 
+# Settings: each can be overridden with an environment variable
 SG_NAME="${SG_NAME:-devops-sg}"
 SG_DESCRIPTION="${SG_DESCRIPTION:-Allow SSH and HTTP for AutomationLab}"
 PROJECT_TAG="${PROJECT_TAG:-AutomationLab}"
@@ -15,11 +16,14 @@ AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}"
 export AWS_REGION
 export AWS_PAGER=""
 
+# Messages go to stderr so stdout only carries results
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
+# On any unexpected failure, report the line and command
 trap 'die "Command failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
+# Open a TCP port to a CIDR range; a rule that already exists is skipped, not an error
 allow_ingress() {
   local port=$1 cidr=$2 description=$3 output
   if output=$(aws ec2 authorize-security-group-ingress \
@@ -35,11 +39,13 @@ allow_ingress() {
   fi
 }
 
+# Preflight: CLI installed, region set, credentials valid
 command -v aws >/dev/null 2>&1 || die "AWS CLI is not installed"
 [[ -n "$AWS_REGION" ]] || die "No AWS region set. Run 'aws configure' or export AWS_REGION"
 aws sts get-caller-identity >/dev/null 2>&1 || die "AWS credentials are missing or invalid"
 log "Region: ${AWS_REGION}"
 
+# Use the given VPC, or fall back to the region's default VPC
 if [[ -z "$VPC_ID" ]]; then
   VPC_ID=$(aws ec2 describe-vpcs \
     --filters Name=is-default,Values=true \
@@ -59,6 +65,7 @@ if [[ -z "$SSH_CIDR" ]]; then
 fi
 log "SSH will be allowed from: ${SSH_CIDR}"
 
+# Reuse the group if it already exists in this VPC, otherwise create it (tagged)
 SG_ID=$(aws ec2 describe-security-groups \
   --filters Name=group-name,Values="$SG_NAME" Name=vpc-id,Values="$VPC_ID" \
   --query 'SecurityGroups[0].GroupId' --output text)
@@ -75,9 +82,11 @@ else
   log "Security group ${SG_NAME} already exists: ${SG_ID} (reusing)"
 fi
 
+# Inbound rules: SSH from your IP, HTTP from anywhere
 allow_ingress 22 "$SSH_CIDR" "SSH access"
 allow_ingress 80 "$HTTP_CIDR" "HTTP access"
 
+# Summary: group ID and its inbound rules
 echo
 echo "Security group ID: ${SG_ID}"
 echo "Inbound rules:"

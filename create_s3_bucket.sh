@@ -4,6 +4,7 @@
 
 set -euo pipefail
 
+# Settings: each can be overridden with an environment variable
 BUCKET_PREFIX="${BUCKET_PREFIX:-automationlab}"
 BUCKET_NAME="${BUCKET_NAME:-}"
 PROJECT_TAG="${PROJECT_TAG:-AutomationLab}"
@@ -13,19 +14,23 @@ AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || true)}"
 export AWS_REGION
 export AWS_PAGER=""
 
+# Messages go to stderr so stdout only carries results
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
+# Scratch folder for policy.json and welcome.txt, removed however the script exits
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 trap 'die "Command failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
+# Preflight: tools installed, region set, credentials valid
 command -v aws >/dev/null 2>&1 || die "AWS CLI is not installed"
 command -v jq >/dev/null 2>&1 || die "jq is not installed"
 [[ -n "$AWS_REGION" ]] || die "No AWS region set. Run 'aws configure' or export AWS_REGION"
 aws sts get-caller-identity >/dev/null 2>&1 || die "AWS credentials are missing or invalid"
 log "Region: ${AWS_REGION}"
 
+# Bucket names are global: reuse our tagged bucket if one exists, else generate a random name
 if [[ -z "$BUCKET_NAME" ]]; then
   BUCKET_NAME=$(aws resourcegroupstaggingapi get-resources \
     --resource-type-filters s3 \
@@ -40,6 +45,7 @@ if [[ -z "$BUCKET_NAME" ]]; then
   fi
 fi
 
+# S3 naming rules: 3-63 chars, lowercase letters, digits, dots, hyphens
 [[ "$BUCKET_NAME" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] ||
   die "Invalid bucket name '${BUCKET_NAME}': use 3-63 lowercase letters, digits, dots or hyphens"
 
@@ -50,6 +56,7 @@ else
   LOCATION_ARGS=(--create-bucket-configuration "LocationConstraint=${AWS_REGION}")
 fi
 
+# Create the bucket; "already yours" is fine, "owned by someone else" is fatal
 if output=$(aws s3api create-bucket --bucket "$BUCKET_NAME" "${LOCATION_ARGS[@]}" 2>&1); then
   log "Created bucket ${BUCKET_NAME}"
 elif [[ "$output" == *"BucketAlreadyOwnedByYou"* ]]; then
@@ -62,6 +69,7 @@ fi
 
 aws s3api wait bucket-exists --bucket "$BUCKET_NAME"
 
+# Harden the bucket: private, tagged, versioned, encrypted at rest
 aws s3api put-public-access-block --bucket "$BUCKET_NAME" \
   --public-access-block-configuration \
   BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
@@ -80,6 +88,7 @@ aws s3api put-bucket-encryption --bucket "$BUCKET_NAME" \
   '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}'
 log "Default encryption set (SSE-S3)"
 
+# Bucket policy: deny any request that is not made over HTTPS
 cat >"${TMP_DIR}/policy.json" <<EOF
 {
   "Version": "2012-10-17",
@@ -101,6 +110,7 @@ EOF
 aws s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy "file://${TMP_DIR}/policy.json"
 log "Bucket policy applied (HTTPS only)"
 
+# Generate and upload the sample file; each upload becomes a new version
 cat >"${TMP_DIR}/${OBJECT_KEY}" <<EOF
 Welcome to the ${PROJECT_TAG} S3 bucket!
 Uploaded by create_s3_bucket.sh on $(date -u '+%Y-%m-%d %H:%M:%S UTC').
@@ -110,6 +120,7 @@ VERSION_ID=$(aws s3api put-object --bucket "$BUCKET_NAME" --key "$OBJECT_KEY" \
   --query 'VersionId' --output text)
 log "Uploaded ${OBJECT_KEY} (version ${VERSION_ID})"
 
+# Summary: versioning status, policy and all object versions
 echo
 echo "Bucket:     ${BUCKET_NAME}"
 echo "Region:     ${AWS_REGION}"
