@@ -86,6 +86,18 @@ fi
 allow_ingress 22 "$SSH_CIDR" "SSH access"
 allow_ingress 80 "$HTTP_CIDR" "HTTP access"
 
+# Your public IP can change: revoke SSH rules this script added for previous IPs
+STALE_RULES=$(aws ec2 describe-security-group-rules \
+  --filters Name=group-id,Values="$SG_ID" \
+  --query "SecurityGroupRules[?IsEgress==\`false\` && FromPort==\`22\` && Description=='SSH access' && CidrIpv4!='${SSH_CIDR}'].SecurityGroupRuleId" \
+  --output text)
+read -ra STALE_RULE_IDS <<<"$STALE_RULES"
+if ((${#STALE_RULE_IDS[@]} > 0)); then
+  aws ec2 revoke-security-group-ingress --group-id "$SG_ID" \
+    --security-group-rule-ids "${STALE_RULE_IDS[@]}" >/dev/null
+  log "Revoked ${#STALE_RULE_IDS[@]} old SSH rule(s): ${STALE_RULE_IDS[*]}"
+fi
+
 # Summary: group ID and its inbound rules
 echo
 echo "Security group ID: ${SG_ID}"

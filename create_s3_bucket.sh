@@ -18,9 +18,40 @@ export AWS_PAGER=""
 log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
 die() { echo "[ERROR] $*" >&2; exit 1; }
 
+# S3 has no server-side tag filter: list this region's buckets and keep the ones tagged
+# Project=$PROJECT_TAG (untagged buckets make get-bucket-tagging fail and are skipped)
+find_project_buckets() {
+  local output bucket project names=()
+  output=$(aws s3api list-buckets --bucket-region "$AWS_REGION" \
+    --query 'Buckets[].Name' --output text) || return 1
+  read -ra names <<<"$output"
+  for bucket in "${names[@]}"; do
+    project=$(aws s3api get-bucket-tagging --bucket "$bucket" \
+      --query "TagSet[?Key=='Project'].Value | [0]" --output text 2>/dev/null) || continue
+    if [[ "$project" == "$PROJECT_TAG" ]]; then
+      echo "$bucket"
+    fi
+  done
+}
+
+# S3 can't tag at creation, so a bucket created this run is rolled back if the script
+# stops before tagging it; otherwise cleanup_resources.sh could never find it
+BUCKET_UNTAGGED=false
+on_exit() {
+  if [[ "$BUCKET_UNTAGGED" == true ]]; then
+    if aws s3api delete-bucket --bucket "$BUCKET_NAME" >/dev/null 2>&1; then
+      log "Rolled back: deleted untagged bucket ${BUCKET_NAME}"
+    else
+      log "WARNING: could not delete untagged bucket ${BUCKET_NAME}; delete it manually"
+    fi
+  fi
+  rm -rf "$TMP_DIR"
+}
+
 # Scratch folder for policy.json and welcome.txt, removed however the script exits
 TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+trap on_exit EXIT
+trap 'exit 130' INT TERM
 trap 'die "Command failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
 # Preflight: tools installed, region set, credentials valid
@@ -32,12 +63,9 @@ log "Region: ${AWS_REGION}"
 
 # Bucket names are global: reuse our tagged bucket if one exists, else generate a random name
 if [[ -z "$BUCKET_NAME" ]]; then
-  BUCKET_NAME=$(aws resourcegroupstaggingapi get-resources \
-    --resource-type-filters s3 \
-    --tag-filters Key=Project,Values="$PROJECT_TAG" \
-    --query 'ResourceTagMappingList[0].ResourceARN' --output text)
-  if [[ "$BUCKET_NAME" != "None" ]]; then
-    BUCKET_NAME="${BUCKET_NAME#arn:aws:s3:::}"
+  found=$(find_project_buckets) || die "Could not list S3 buckets"
+  if [[ -n "$found" ]]; then
+    BUCKET_NAME="${found%%$'\n'*}"
     log "Found existing ${PROJECT_TAG} bucket: ${BUCKET_NAME} (reusing)"
   else
     SUFFIX=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
@@ -58,6 +86,7 @@ fi
 
 # Create the bucket; "already yours" is fine, "owned by someone else" is fatal
 if output=$(aws s3api create-bucket --bucket "$BUCKET_NAME" "${LOCATION_ARGS[@]}" 2>&1); then
+  BUCKET_UNTAGGED=true
   log "Created bucket ${BUCKET_NAME}"
 elif [[ "$output" == *"BucketAlreadyOwnedByYou"* ]]; then
   log "Bucket ${BUCKET_NAME} already exists in your account (reusing)"
@@ -77,6 +106,7 @@ log "Public access blocked"
 
 aws s3api put-bucket-tagging --bucket "$BUCKET_NAME" \
   --tagging "TagSet=[{Key=Name,Value=${BUCKET_NAME}},{Key=Project,Value=${PROJECT_TAG}}]"
+BUCKET_UNTAGGED=false
 log "Tagged with Project=${PROJECT_TAG}"
 
 aws s3api put-bucket-versioning --bucket "$BUCKET_NAME" \

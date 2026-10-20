@@ -61,6 +61,22 @@ delete_security_group() {
   done
 }
 
+# S3 has no server-side tag filter: list this region's buckets and keep the ones tagged
+# Project=$PROJECT_TAG (untagged buckets make get-bucket-tagging fail and are skipped)
+find_project_buckets() {
+  local output bucket project names=()
+  output=$(aws s3api list-buckets --bucket-region "$AWS_REGION" \
+    --query 'Buckets[].Name' --output text) || return 1
+  read -ra names <<<"$output"
+  for bucket in "${names[@]}"; do
+    project=$(aws s3api get-bucket-tagging --bucket "$bucket" \
+      --query "TagSet[?Key=='Project'].Value | [0]" --output text 2>/dev/null) || continue
+    if [[ "$project" == "$PROJECT_TAG" ]]; then
+      echo "$bucket"
+    fi
+  done
+}
+
 # A versioned bucket is only empty once every version and delete marker is gone
 empty_bucket() {
   local bucket=$1 versions batch_file="${TMP_DIR}/delete.json" count errors
@@ -102,18 +118,11 @@ json=$(aws ec2 describe-key-pairs \
   --query 'KeyPairs[].KeyName' --output json)
 mapfile -t KEY_NAMES < <(jq -r '.[]' <<<"$json")
 
-json=$(aws resourcegroupstaggingapi get-resources \
-  --resource-type-filters s3 \
-  --tag-filters Key=Project,Values="$PROJECT_TAG" \
-  --query 'ResourceTagMappingList[].ResourceARN' --output json)
-mapfile -t TAGGED_BUCKETS < <(jq -r '.[] | sub("^arn:aws:s3:::"; "")' <<<"$json")
+found=$(find_project_buckets) || die "Could not list S3 buckets"
 BUCKETS=()
-for bucket in "${TAGGED_BUCKETS[@]}"; do
-  # The tagging API can briefly list buckets that were already deleted.
-  if aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
-    BUCKETS+=("$bucket")
-  fi
-done
+if [[ -n "$found" ]]; then
+  mapfile -t BUCKETS <<<"$found"
+fi
 
 # Always show what was found before doing anything
 echo
